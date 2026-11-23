@@ -1,0 +1,8 @@
+.tools/
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+runs/
+dist/
+dist-*/
