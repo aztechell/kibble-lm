@@ -1,0 +1,980 @@
+diff --git a/docs/AI_MODELS.md b/docs/AI_MODELS.md
+index 31b795888d6bf5f1003fc750fa307875d86e6534..d8f340cce0e9ebb59847cadf6b08b27352e6014e 100644
+--- a/docs/AI_MODELS.md
++++ b/docs/AI_MODELS.md
+@@ -52,6 +52,27 @@ confidence to distinguish valid inference from an unsuitable image.
+ 
+ ## Included consumers
+ 
++### KibbleLM
++
++KibbleLM generates an English story continuation on the LCD. It uses the
++shared KModel v4 runtime for four KPU convolutions. Its CPU output projection,
++embedding table, and tokenizer are stored in `cpu.bin` beside the model.
++Place both exported files under `/hackylens.kmodels/kibblelm/` on a FAT32 card.
++The firmware descriptor pins the CRC of each file. Copy the matching generated
++`kibble_model_contract.h` into `firmware/src/runtime/` before building for a
++different checkpoint.
++
++Choose a prompt with LEFT or RIGHT and tap OK to generate. While the story is
++on screen, LEFT scrolls back and RIGHT scrolls forward. A tap moves one line
++and holding the button keeps scrolling. The view follows new text when it
++reaches the bottom. At the generation limit, the display ends at a word
++boundary. Hold OK to clear the story and return to choosing a prompt. BACK
++leaves the app.
++
++When the model is ready, the debug UART accepts `HKKL` to generate from the
++preset or `HKKL <prompt>` for up to 24 printable ASCII characters.
++`HKKLINFO` reports the text and the inference and generation timings.
++
+ ### FACE DETECT
+ 
+ FACE DETECT continues to load:
+diff --git a/firmware/src/services/resource_cleanup.h b/firmware/src/services/resource_cleanup.h
+index 51580ade0ac35a50b6d1c84956c72ec400ef53bf..2a706ba3d8bfce1bd35fb2712a721f98e5bd00f3 100644
+--- a/firmware/src/services/resource_cleanup.h
++++ b/firmware/src/services/resource_cleanup.h
+@@ -9,6 +9,7 @@ typedef enum
+     RESOURCE_CLEANUP_FACE_RECOGNITION,
+     RESOURCE_CLEANUP_SCRIPT_SD,
+     RESOURCE_CLEANUP_CAMERA_CODE,
++    RESOURCE_CLEANUP_KIBBLE,
+     RESOURCE_CLEANUP_COUNT,
+ } resource_cleanup_slot_t;
+ /* Called on core0. Return one only when the resource is released or quarantined.
+diff --git a/firmware/src/apps/kibble_lm/app.toml b/firmware/src/apps/kibble_lm/app.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b3d768f72aa3461fe6f24e7978ed6f777d685e8
+--- /dev/null
++++ b/firmware/src/apps/kibble_lm/app.toml
+@@ -0,0 +1,11 @@
++id = "kibble-lm"
++name = "KibbleLM"
++entry = "kibble_lm_v2_entry"
++sources = ["kibble_lm_app.c"]
++requires = ["display", "input", "time", "sd-card"]
++menu_order = 137
++menu_icon = "label"
++tick_ms = 5
++tick_budget_ms = 150
++debug_entry = "kibble_lm_debug"
++debug = "HKKL [prompt]/HKKLINFO"
+diff --git a/firmware/src/apps/kibble_lm/kibble_lm_app.c b/firmware/src/apps/kibble_lm/kibble_lm_app.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a31b2b33537e7adefbc2ccd0e804e7c82c04c75
+--- /dev/null
++++ b/firmware/src/apps/kibble_lm/kibble_lm_app.c
+@@ -0,0 +1,418 @@
++#include <ctype.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <hackylens/app.h>
++#include <hackylens/app/kibble.h>
++#include <hackylens/app/panel.h>
++
++enum { BODY_TOP = 32, GLYPH_W = 14, GLYPH_H = 24, GENERATION_SEED = 210, OK_HOLD_US = 700000 };
++enum { SCROLL_REPEAT_INITIAL_US = 500000, SCROLL_REPEAT_NEXT_US = 180000 };
++enum { TEXT_BYTES = HK_KIBBLE_PROMPT_MAX + HK_KIBBLE_TOKEN_MAX * HK_KIBBLE_GENERATION_MAX + 1 };
++#define FOLLOW_TAIL UINT16_MAX
++
++typedef enum { LOADING, READY, GENERATING, COMPLETE, ERROR } kibble_phase_t;
++
++typedef struct
++{
++    const hk_time_t *clock;
++    const char *status;
++    uint64_t started, first_us, elapsed_us;
++    uint64_t ok_hold_due_us, scroll_due_us;
++    uint32_t accelerator_us, head_us;
++    uint16_t text_bytes, prompt_bytes;
++    uint16_t width, height;
++    uint16_t first_line, last_first_line;
++    uint8_t prompt, tokens, queued, full, ok_can_start, scroll_button;
++    kibble_phase_t phase;
++    char custom[HK_KIBBLE_PROMPT_MAX + 1];
++    char text[TEXT_BYTES];
++} kibble_app_t;
++
++static const char *const prompts[] = {
++    "Once upon a time", "A little dog", "One sunny day", "In a small town",
++};
++enum { PROMPT_COUNT = sizeof(prompts) / sizeof(prompts[0]) };
++static _Alignas(HK_APP_STATE_ALIGNMENT) uint8_t storage[1024];
++static kibble_app_t *active;
++_Static_assert(sizeof(kibble_app_t) <= sizeof(storage), "KibbleLM runtime state");
++
++static uint64_t now_us(const kibble_app_t *app)
++{
++    uint64_t now = 0;
++    (void)hk_time_now_us(app->clock, &now);
++    return now;
++}
++
++static hk_result_t redraw(const hk_app_context_t *ctx, const kibble_app_t *app)
++{
++    if(app->full || !app->width || app->height <= BODY_TOP + 2U)
++        return hk_app_context_request_render(ctx, NULL);
++    hk_display_rect_t body = {2U, BODY_TOP, app->width - 4U, app->height - BODY_TOP - 2U};
++    return hk_app_context_request_render(ctx, &body);
++}
++
++static void reset_output(kibble_app_t *app, const char *prompt)
++{
++    strcpy(app->text, prompt);
++    app->text_bytes = app->prompt_bytes = (uint16_t)strlen(prompt);
++    app->first_line = FOLLOW_TAIL;
++    app->last_first_line = 0U;
++    app->scroll_button = 0U;
++    app->started = app->first_us = app->elapsed_us = 0U;
++    app->accelerator_us = app->head_us = app->tokens = 0U;
++}
++
++static void finish_at_word_boundary(kibble_app_t *app)
++{
++    /* At the token limit, a trailing word may still need another subword. */
++    uint16_t end = app->text_bytes;
++    while(end > app->prompt_bytes)
++    {
++        unsigned char ch = (unsigned char)app->text[end - 1U];
++        if(!isalnum(ch) && ch != '\'' && ch != '-')
++            break;
++        --end;
++    }
++    while(end > app->prompt_bytes && app->text[end - 1U] == ' ')
++        --end;
++    app->text[end] = '\0';
++    app->text_bytes = end;
++}
++
++static hk_result_t clear_output(const hk_app_context_t *ctx, kibble_app_t *app)
++{
++    app->ok_hold_due_us = 0U;
++    app->queued = 0U;
++    app->custom[0] = '\0';
++    reset_output(app, prompts[app->prompt]);
++    if(app->phase == GENERATING)
++    {
++        (void)hk_app_kibble_close(ctx, (hk_deadline_t){ now_us(app) + 250000U });
++        app->phase = LOADING;
++        app->status = "Loading model";
++    }
++    else if(app->phase == COMPLETE)
++    {
++        app->phase = READY;
++        app->status = "Choose a prompt";
++    }
++    return redraw(ctx, app);
++}
++
++static hk_result_t start_generation(const hk_app_context_t *ctx, kibble_app_t *app)
++{
++    const char *prompt = app->custom[0] ? app->custom : prompts[app->prompt];
++    reset_output(app, prompt);
++    uint32_t seed = app->queued ? GENERATION_SEED : (uint32_t)now_us(app);
++    if(hk_app_kibble_start(ctx, prompt, seed) != HK_OK)
++    {
++        app->phase = ERROR;
++        app->status = "Cannot start";
++        (void)hk_app_kibble_close(ctx, (hk_deadline_t){ now_us(app) + 250000U });
++    }
++    else
++    {
++        app->started = now_us(app);
++        app->phase = GENERATING;
++        app->status = "Generating";
++    }
++    app->queued = 0U;
++    return redraw(ctx, app);
++}
++
++static hk_result_t kibble_lm_start(const hk_app_context_t *ctx)
++{
++    void *state;
++    uint32_t capacity;
++    hk_result_t result = hk_app_context_state(ctx, &state, &capacity);
++    if(result != HK_OK || capacity < sizeof(kibble_app_t))
++        return result != HK_OK ? result : HK_ERR_LIMIT;
++    kibble_app_t *app = state;
++    *app = (kibble_app_t){ .phase = LOADING, .status = "Loading model", .full = 1U };
++    result = hk_app_context_time(ctx, &app->clock);
++    if(result != HK_OK)
++        return result;
++    active = app;
++    reset_output(app, prompts[0]);
++    return HK_OK;
++}
++
++static uint8_t shows_story(const kibble_app_t *app)
++{
++    return app->phase == GENERATING || app->phase == COMPLETE || app->tokens;
++}
++
++static hk_result_t navigate(const hk_app_context_t *ctx, kibble_app_t *app, uint8_t forward)
++{
++    if(shows_story(app))
++    {
++        uint16_t line = app->first_line == FOLLOW_TAIL ? app->last_first_line : app->first_line;
++        if(forward ? line >= app->last_first_line : line == 0U)
++            return HK_OK;
++        line = (uint16_t)(forward ? line + 1U : line - 1U);
++        app->first_line = line == app->last_first_line ? FOLLOW_TAIL : line;
++    }
++    else
++    {
++        unsigned delta = forward ? 1U : PROMPT_COUNT - 1U;
++        app->prompt = (uint8_t)((app->prompt + delta) % PROMPT_COUNT);
++        app->custom[0] = '\0';
++        reset_output(app, prompts[app->prompt]);
++    }
++    return redraw(ctx, app);
++}
++
++static hk_result_t on_timer(const hk_app_context_t *ctx, kibble_app_t *app, uint64_t now)
++{
++    if(app->ok_hold_due_us && now >= app->ok_hold_due_us)
++        return clear_output(ctx, app);
++    if(app->scroll_button && now >= app->scroll_due_us)
++    {
++        app->scroll_due_us = now + SCROLL_REPEAT_NEXT_US;
++        hk_result_t result = navigate(ctx, app, app->scroll_button == HK_INPUT_BUTTON_RIGHT);
++        if(result != HK_OK)
++            return result;
++    }
++    if(app->phase == LOADING)
++    {
++        hk_result_t result = hk_app_kibble_open_step(ctx, &app->status);
++        if(result == HK_PENDING)
++            return HK_OK;
++        app->phase = result == HK_OK ? READY : ERROR;
++        if(result == HK_OK)
++            app->status = "Choose a prompt";
++        return redraw(ctx, app);
++    }
++    if(app->queued && (app->phase == READY || app->phase == COMPLETE))
++        return start_generation(ctx, app);
++    if(app->phase != GENERATING)
++        return HK_OK;
++
++    hk_kibble_token_t token;
++    hk_result_t result = hk_app_kibble_poll(ctx, &token);
++    if(result == HK_PENDING)
++        return HK_OK;
++    if(result != HK_OK)
++    {
++        (void)hk_app_kibble_close(ctx, (hk_deadline_t){ now_us(app) + 250000U });
++        app->phase = ERROR;
++        app->status = "Inference failed";
++        return redraw(ctx, app);
++    }
++
++    app->elapsed_us = now_us(app) - app->started;
++    app->accelerator_us += token.accelerator_us;
++    app->head_us += token.cpu_us;
++    if(!token.end)
++    {
++        if(!app->tokens)
++            app->first_us = app->elapsed_us;
++        size_t length = strlen(token.text);
++        memcpy(app->text + app->text_bytes, token.text, length + 1U);
++        app->text_bytes += (uint16_t)length;
++        ++app->tokens;
++    }
++    if(token.end || app->tokens == HK_KIBBLE_GENERATION_MAX)
++    {
++        if(!token.end)
++            finish_at_word_boundary(app);
++        app->phase = COMPLETE;
++        app->status = "Done";
++    }
++    return redraw(ctx, app);
++}
++
++static hk_result_t kibble_lm_event(const hk_app_context_t *ctx, const hk_app_event_t *event)
++{
++    kibble_app_t *app = active;
++    if(event->kind == HK_APP_EVENT_TIMER)
++        return on_timer(ctx, app, event->timestamp_us);
++    if(event->kind == HK_APP_EVENT_MEDIA)
++    {
++        if(event->data.media.kind == HK_APP_MEDIA_REMOVED || event->data.media.kind == HK_APP_MEDIA_ERROR)
++        {
++            (void)hk_app_kibble_close(ctx, (hk_deadline_t){ now_us(app) + 250000U });
++            app->phase = ERROR;
++            app->status = "Insert model SD";
++            app->queued = 0U;
++            app->ok_hold_due_us = 0U;
++            app->scroll_button = 0U;
++            return redraw(ctx, app);
++        }
++        if(app->phase == ERROR)
++            app->phase = LOADING;
++        return HK_OK;
++    }
++    if(event->kind != HK_APP_EVENT_INPUT)
++        return HK_OK;
++    const hk_input_event_t *input = &event->data.input;
++    uint32_t buttons = input->pressed;
++    if(buttons & HK_INPUT_BUTTON_BACK)
++        return hk_app_context_request_close(ctx);
++    if(input->dropped)
++        app->ok_hold_due_us = 0U;
++    if(input->dropped || (input->released & app->scroll_button))
++        app->scroll_button = 0U;
++    if((buttons & HK_INPUT_BUTTON_OK) && app->phase != LOADING)
++    {
++        app->ok_hold_due_us = event->timestamp_us + OK_HOLD_US;
++        app->ok_can_start = app->phase != GENERATING;
++    }
++    if((input->released & HK_INPUT_BUTTON_OK) && app->ok_hold_due_us)
++    {
++        uint64_t hold_due = app->ok_hold_due_us;
++        app->ok_hold_due_us = 0U;
++        if(event->timestamp_us >= hold_due)
++            return clear_output(ctx, app);
++        if(!app->ok_can_start || app->phase == GENERATING || app->phase == LOADING || app->queued)
++            return HK_OK;
++        if(app->phase == ERROR)
++        {
++            app->phase = LOADING;
++            return HK_OK;
++        }
++        return start_generation(ctx, app);
++    }
++    if(buttons & (HK_INPUT_BUTTON_LEFT | HK_INPUT_BUTTON_RIGHT))
++    {
++        uint8_t forward = (buttons & HK_INPUT_BUTTON_RIGHT) != 0U;
++        if(shows_story(app))
++        {
++            app->scroll_button = forward ? HK_INPUT_BUTTON_RIGHT : HK_INPUT_BUTTON_LEFT;
++            app->scroll_due_us = event->timestamp_us + SCROLL_REPEAT_INITIAL_US;
++        }
++        return navigate(ctx, app, forward);
++    }
++    return HK_OK;
++}
++
++static const char *wrap(const char *text, unsigned columns, unsigned *length)
++{
++    unsigned i = 0, space = 0;
++    while(text[i] && i < columns)
++    {
++        if(text[i] == ' ')
++            space = i;
++        ++i;
++    }
++    if(text[i] && text[i] != ' ' && space)
++        i = space;
++    *length = i;
++    while(text[i] == ' ')
++        ++i;
++    return text + i;
++}
++
++static hk_result_t kibble_lm_render(const hk_app_context_t *ctx, hk_app_surface_t *surface)
++{
++    (void)ctx;
++    kibble_app_t *app = active;
++    hk_app_panel_t panel = hk_app_panel_begin(surface);
++    if(panel.result != HK_OK)
++        return panel.result;
++    app->width = panel.width;
++    app->height = panel.height;
++    if(app->full)
++        hk_app_panel_chrome(&panel, "KibbleLM");
++    app->full = 0U;
++    if(panel.width < GLYPH_W + 16U || panel.height < BODY_TOP + 2U * GLYPH_H + 4U)
++        return panel.result;
++    const unsigned status_y = panel.height - GLYPH_H - 4U;
++    const unsigned rows = (status_y - BODY_TOP) / GLYPH_H;
++    unsigned columns = (panel.width - 16U) / GLYPH_W;
++    char line[32];
++    if(columns >= sizeof(line))
++        columns = sizeof(line) - 1U;
++    if(!rows || !columns)
++        return panel.result;
++
++    unsigned total = 0, length;
++    const char *text = app->text;
++    for(const char *p = text; *p; p = wrap(p, columns, &length))
++        ++total;
++    app->last_first_line = (uint16_t)(total > rows ? total - rows : 0U);
++    unsigned first = app->first_line;
++    if(first > app->last_first_line)
++        first = app->last_first_line;
++    if(app->first_line != FOLLOW_TAIL)
++        app->first_line = (uint16_t)first;
++    for(unsigned i = 0; i < first; ++i)
++        text = wrap(text, columns, &length);
++    hk_app_panel_fill(&panel, 2, BODY_TOP, panel.width - 4, panel.height - BODY_TOP - 2, HK_PANEL_BLACK);
++    for(unsigned row = 0; *text && row < rows; ++row)
++    {
++        const char *next = wrap(text, columns, &length);
++        memcpy(line, text, length);
++        line[length] = '\0';
++        hk_app_panel_label(&panel, 8, BODY_TOP + row * GLYPH_H, panel.width - 16,
++                           line, 0xffffU, HK_PANEL_LEFT);
++        text = next;
++    }
++    const char *status = app->status;
++    char position[32];
++    if(app->last_first_line && (app->phase == GENERATING || app->phase == COMPLETE))
++    {
++        snprintf(position, sizeof(position), "%s %u-%u/%u",
++                 app->phase == GENERATING ? "Gen" : "Done", first + 1U, first + rows, total);
++        status = position;
++    }
++    hk_app_panel_status(&panel, status_y, status);
++    return panel.result;
++}
++
++static hk_result_t kibble_lm_stop(const hk_app_context_t *ctx)
++{
++    active = NULL;
++    hk_deadline_t deadline;
++    hk_result_t result = hk_app_context_teardown_deadline(ctx, &deadline);
++    return result == HK_OK ? hk_app_kibble_close(ctx, deadline) : result;
++}
++
++uint8_t kibble_lm_debug(const char *command)
++{
++    kibble_app_t *app = active;
++    if(strcmp(command, "HKKLINFO") == 0)
++    {
++        if(!app)
++            puts("HKKLINFO active=0");
++        else
++        {
++            printf("HKKLINFO phase=%u tokens=%u first_us=%" PRIu64 " elapsed_us=%" PRIu64
++                   " accelerator_us=%" PRIu32 " head_us=%" PRIu32 "\r\n", (unsigned)app->phase,
++                   (unsigned)app->tokens, app->first_us, app->elapsed_us, app->accelerator_us, app->head_us);
++            printf("HKKL TEXT %s\r\n", app->text);
++        }
++        return 1U;
++    }
++    int preset = strcmp(command, "HKKL") == 0;
++    if(!preset && strncmp(command, "HKKL ", 5) != 0)
++        return 0U;
++    const char *prompt = preset ? "" : command + 5;
++    size_t length = strlen(prompt);
++    if(!app || (app->phase != READY && app->phase != COMPLETE) || (!preset && !length) ||
++       length > HK_KIBBLE_PROMPT_MAX)
++    {
++        puts("HKKL ERROR");
++        return 1U;
++    }
++    for(size_t i = 0; i < length; ++i)
++    {
++        if((uint8_t)prompt[i] < 32U || (uint8_t)prompt[i] > 126U)
++        {
++            puts("HKKL ERROR");
++            return 1U;
++        }
++    }
++    memcpy(app->custom, prompt, length + 1U);
++    app->queued = 1U;
++    puts("HKKL OK");
++    return 1U;
++}
++
++const hk_app_v2_entry_t kibble_lm_v2_entry = {
++    .state_storage = storage, .state_capacity_bytes = sizeof(storage),
++    .start = kibble_lm_start, .event = kibble_lm_event,
++    .render = kibble_lm_render, .stop = kibble_lm_stop,
++};
+diff --git a/firmware/src/core/kibble_decode.c b/firmware/src/core/kibble_decode.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1233c9976d4b7242af64b81e394e42721deaeb1
+--- /dev/null
++++ b/firmware/src/core/kibble_decode.c
+@@ -0,0 +1,140 @@
++#include "kibble_decode.h"
++
++#include <math.h>
++#include <string.h>
++
++_Static_assert(sizeof(kibble_merge_t) == 8, "KLB1 merge record");
++_Static_assert(sizeof(kibble_cpu_model_t) == 263608, "KLB1 size");
++
++static const kibble_merge_t *lookup(const kibble_cpu_model_t *model, uint16_t left, uint16_t right)
++{
++    uint32_t key = ((uint32_t)left << 16) | right;
++    unsigned begin = 0;
++    unsigned end = KIBBLE_MERGES;
++    while(begin < end)
++    {
++        unsigned mid = begin + (end - begin) / 2U;
++        const kibble_merge_t *candidate = &model->merges[mid];
++        uint32_t candidate_key = ((uint32_t)candidate->left << 16) | candidate->right;
++        if(candidate_key == key)
++            return candidate;
++        if(candidate_key < key)
++            begin = mid + 1;
++        else
++            end = mid;
++    }
++    return NULL;
++}
++
++int kibble_tokenize(const kibble_cpu_model_t *model, const char *prompt,
++                    uint16_t context[KIBBLE_CONTEXT])
++{
++    uint16_t tokens[KIBBLE_PROMPT_BYTES];
++    size_t count = 0;
++    for(; prompt[count]; ++count)
++    {
++        unsigned ch = (uint8_t)prompt[count];
++        if(count == KIBBLE_PROMPT_BYTES || ch < KIBBLE_ASCII_FIRST ||
++           ch >= KIBBLE_ASCII_FIRST + KIBBLE_ASCII_COUNT)
++            return 0;
++        tokens[count] = model->ascii[ch - KIBBLE_ASCII_FIRST];
++    }
++    for(;;)
++    {
++        const kibble_merge_t *best = NULL;
++        size_t pair = 0;
++        for(size_t i = 1; i < count; ++i)
++        {
++            const kibble_merge_t *candidate = lookup(model, tokens[i - 1], tokens[i]);
++            if(candidate && (!best || candidate->rank < best->rank))
++            {
++                best = candidate;
++                pair = i - 1;
++            }
++        }
++        if(!best)
++            break;
++        tokens[pair] = best->token;
++        memmove(tokens + pair + 1, tokens + pair + 2, (--count - pair - 1) * sizeof(tokens[0]));
++    }
++    memset(context, 0, KIBBLE_CONTEXT * sizeof(context[0]));
++    context[KIBBLE_CONTEXT - count - 1] = KIBBLE_BOS;
++    memcpy(context + KIBBLE_CONTEXT - count, tokens, count * sizeof(tokens[0]));
++    return 1;
++}
++
++void kibble_input(const kibble_cpu_model_t *model, const uint16_t context[KIBBLE_CONTEXT],
++                  uint8_t input[KIBBLE_INPUT_BYTES])
++{
++    for(unsigned y = 0; y < KIBBLE_HEIGHT; ++y)
++        for(unsigned x = 0; x < KIBBLE_WIDTH; ++x)
++        {
++            unsigned seq_x = y % 2 ? KIBBLE_WIDTH - 1 - x : x;
++            /* Rotate the snake so the newest token lies at (2, 3). */
++            unsigned index = (y * KIBBLE_WIDTH + seq_x + 12) % KIBBLE_CONTEXT;
++            const uint8_t *embedding = model->embeddings[context[index]];
++            for(unsigned c = 0; c < KIBBLE_EMBED; ++c)
++                input[c * KIBBLE_CONTEXT + y * KIBBLE_WIDTH + x] = embedding[c];
++        }
++}
++
++uint16_t kibble_sample(const kibble_cpu_model_t *model, const float *output, uint32_t *seed)
++{
++    enum { TOP = 16, CENTER = 2 * KIBBLE_WIDTH + 3 };
++    float maximum = 0;
++    for(unsigned c = 0; c < KIBBLE_FEATURES; ++c)
++        maximum = fmaxf(maximum, output[c * KIBBLE_CONTEXT + CENTER]);
++    float feature_scale = maximum > 0 ? maximum / 255.0f : 1.0f;
++    uint8_t features[KIBBLE_FEATURES];
++    for(unsigned c = 0; c < KIBBLE_FEATURES; ++c)
++    {
++        float value = output[c * KIBBLE_CONTEXT + CENTER] / feature_scale;
++        features[c] = (uint8_t)(fminf(255.0f, fmaxf(0.0f, value)) + 0.5f);
++    }
++
++    float logits[TOP];
++    uint16_t tokens[TOP] = {0};
++    for(unsigned i = 0; i < TOP; ++i)
++        logits[i] = -INFINITY;
++    for(unsigned token = KIBBLE_EOS; token < KIBBLE_VOCAB; ++token)
++    {
++        int32_t dot = 0;
++        for(unsigned c = 0; c < KIBBLE_FEATURES; ++c)
++            dot += features[c] * model->weights[token][c];
++        float logit = (float)dot * feature_scale * model->scale[token] + model->bias[token];
++        if(logit <= logits[TOP - 1])
++            continue;
++        unsigned i = TOP - 1;
++        while(i && logit > logits[i - 1])
++        {
++            logits[i] = logits[i - 1];
++            tokens[i] = tokens[i - 1];
++            --i;
++        }
++        logits[i] = logit;
++        tokens[i] = (uint16_t)token;
++    }
++    float total = 0;
++    float top = logits[0];
++    for(unsigned i = 0; i < TOP; ++i)
++    {
++        total += expf((logits[i] - top) / 0.85f);
++        logits[i] = total;
++    }
++    uint32_t random = *seed ? *seed : 210U;
++    random ^= random << 13;
++    random ^= random >> 17;
++    random ^= random << 5;
++    *seed = random;
++    float threshold = (float)(random >> 8) * (1.0f / 16777216.0f) * total;
++    unsigned choice = 0;
++    while(choice < TOP - 1 && threshold >= logits[choice])
++        ++choice;
++    return tokens[choice];
++}
++
++void kibble_append(uint16_t context[KIBBLE_CONTEXT], uint16_t token)
++{
++    memmove(context, context + 1, (KIBBLE_CONTEXT - 1) * sizeof(context[0]));
++    context[KIBBLE_CONTEXT - 1] = token;
++}
+diff --git a/firmware/src/core/kibble_decode.h b/firmware/src/core/kibble_decode.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fbf5faac6a3b1f76d8e265d88ccd12101280080d
+--- /dev/null
++++ b/firmware/src/core/kibble_decode.h
+@@ -0,0 +1,56 @@
++#ifndef HK_KIBBLE_DECODE_H
++#define HK_KIBBLE_DECODE_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++enum
++{
++    KIBBLE_VOCAB = 2048,
++    KIBBLE_PAD = 0,
++    KIBBLE_BOS = 1,
++    KIBBLE_EOS = 2,
++    KIBBLE_WIDTH = 8,
++    KIBBLE_HEIGHT = 4,
++    KIBBLE_CONTEXT = KIBBLE_WIDTH * KIBBLE_HEIGHT,
++    KIBBLE_EMBED = 32,
++    KIBBLE_FEATURES = 64,
++    KIBBLE_INPUT_BYTES = KIBBLE_EMBED * KIBBLE_CONTEXT,
++    KIBBLE_OUTPUT_BYTES = sizeof(float) * KIBBLE_FEATURES * KIBBLE_CONTEXT,
++    KIBBLE_PIECE_BYTES = 17,
++    KIBBLE_PROMPT_BYTES = 24,
++    KIBBLE_GENERATED_MAX = 48,
++    KIBBLE_ASCII_FIRST = 32,
++    KIBBLE_ASCII_COUNT = 95,
++    KIBBLE_MERGES = KIBBLE_VOCAB - KIBBLE_ASCII_COUNT - 3,
++};
++
++typedef struct
++{
++    uint16_t left, right, token, rank;
++} kibble_merge_t;
++
++/* KLB1 CPU model, little endian. The firmware checks the CRC from the
++ * generated firmware descriptor before interpreting any table from SD. */
++typedef struct
++{
++    char magic[4];
++    uint32_t model_crc;
++    char pieces[KIBBLE_VOCAB][KIBBLE_PIECE_BYTES];
++    uint16_t ascii[KIBBLE_ASCII_COUNT];
++    uint16_t reserved;
++    kibble_merge_t merges[KIBBLE_MERGES];
++    uint8_t embeddings[KIBBLE_VOCAB][KIBBLE_EMBED];
++    int8_t weights[KIBBLE_VOCAB][KIBBLE_FEATURES];
++    float scale[KIBBLE_VOCAB];
++    float bias[KIBBLE_VOCAB];
++} kibble_cpu_model_t;
++
++int kibble_tokenize(const kibble_cpu_model_t *model, const char *prompt,
++                    uint16_t context[KIBBLE_CONTEXT]);
++void kibble_input(const kibble_cpu_model_t *model, const uint16_t context[KIBBLE_CONTEXT],
++                  uint8_t input[KIBBLE_INPUT_BYTES]);
++uint16_t kibble_sample(const kibble_cpu_model_t *model, const float *output, uint32_t *seed);
++void kibble_append(uint16_t context[KIBBLE_CONTEXT], uint16_t token);
++
++#endif
+diff --git a/firmware/src/runtime/kibble_model_contract.h b/firmware/src/runtime/kibble_model_contract.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c563a90e9e06b36f2175b00b7ad2857d85ae0668
+--- /dev/null
++++ b/firmware/src/runtime/kibble_model_contract.h
+@@ -0,0 +1,13 @@
++#ifndef HK_KIBBLE_MODEL_CONTRACT_H
++#define HK_KIBBLE_MODEL_CONTRACT_H
++
++/* Generated by KibbleLM export.py. Pair with the matching files on SD. */
++#define KIBBLE_MODEL_CRC 0xbde9e77eU
++#define KIBBLE_CPU_CRC 0x216ccebbU
++#define KIBBLE_MODEL_BYTES 119336U
++#define KIBBLE_MODEL_FLAGS 0U
++#define KIBBLE_MODEL_NODES 5U
++#define KIBBLE_MODEL_MAIN 10240U
++#define KIBBLE_MODEL_INPUT_MEMORY 2048U
++
++#endif
+diff --git a/firmware/src/runtime/kibble_sdk.c b/firmware/src/runtime/kibble_sdk.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..bfc60aceb72c38d5dc05477205e6ba8bc0e17a3c
+--- /dev/null
++++ b/firmware/src/runtime/kibble_sdk.c
+@@ -0,0 +1,225 @@
++#include "hk_config.h"
++
++#if HK_ENABLE_APP_KIBBLE_LM
++#include <stdio.h>
++#include <string.h>
++
++#include <hackylens/app/kibble.h>
++
++#include "app_services.h"
++#include "kibble_model_contract.h"
++#include "../core/kibble_decode.h"
++#include "../services/ai_model_runtime.h"
++#include "../services/resource_cleanup.h"
++#include "../storage/ai_model_storage.h"
++
++#define KIBBLE_DIRECTORY "/hackylens.kmodels/kibblelm"
++
++static const ai_model_descriptor_t s_descriptor = {
++    .id = "kibblelm",
++    .directory_path = KIBBLE_DIRECTORY,
++    .model_path = KIBBLE_DIRECTORY "/model.kmodel",
++    .max_model_bytes = KIBBLE_MODEL_BYTES,
++    .expected_model_crc32 = KIBBLE_MODEL_CRC,
++    .unload_timeout_us = 250000U,
++    .kmodel = {
++        .version = 4U, .arch = 1U, .flags = KIBBLE_MODEL_FLAGS,
++        .layers_length = KIBBLE_MODEL_NODES, .main_mem_usage = KIBBLE_MODEL_MAIN,
++        .output_count = 1U, .input_bytes = KIBBLE_MODEL_INPUT_MEMORY,
++    },
++    /* The loader checks the packed KPU memory extent. nncase uploads the
++     * logical CHW tensor from s_input and adds the row padding itself. */
++    .input = { .name = "embeddings", .bytes = KIBBLE_MODEL_INPUT_MEMORY,
++               .shape = {1, KIBBLE_EMBED, KIBBLE_HEIGHT, KIBBLE_WIDTH}, .rank = 4,
++               .element = AI_MODEL_ELEMENT_U8, .layout = AI_MODEL_LAYOUT_CHW },
++    .outputs = {{ .name = "features", .bytes = KIBBLE_OUTPUT_BYTES,
++                  .shape = {1, KIBBLE_FEATURES, KIBBLE_HEIGHT, KIBBLE_WIDTH}, .rank = 4,
++                  .element = AI_MODEL_ELEMENT_F32, .layout = AI_MODEL_LAYOUT_CHW }},
++    .output_count = 1U,
++};
++
++static ai_model_runtime_t s_runtime;
++static ai_model_reader_t s_cpu_reader;
++static uint8_t *s_cpu_bytes;
++static uint32_t s_cpu_crc;
++static uint32_t s_seed;
++static uint16_t s_context[KIBBLE_CONTEXT];
++static _Alignas(256) uint8_t s_input[KIBBLE_INPUT_BYTES];
++static uint64_t s_inference_deadline;
++static uint8_t s_cpu_ready, s_generating, s_inflight, s_closing;
++static uint8_t s_generated;
++
++_Static_assert((int)HK_KIBBLE_PROMPT_MAX == (int)KIBBLE_PROMPT_BYTES, "prompt contract");
++_Static_assert((int)HK_KIBBLE_TOKEN_MAX + 1 == (int)KIBBLE_PIECE_BYTES, "token contract");
++
++static hk_result_t authorized(const hk_app_context_t *ctx, uint8_t starts_work)
++{
++    hk_result_t result = app_service_context(ctx, starts_work);
++    if(result != HK_OK)
++        return result;
++    const char *id;
++    uint32_t generation;
++    result = hk_app_context_identity(ctx, &id, &generation);
++    return result == HK_OK && strcmp(id, "kibble-lm") ? HK_ERR_NOT_DECLARED : result;
++}
++
++static uint64_t now_us(const hk_app_context_t *ctx)
++{
++    const hk_time_t *clock;
++    uint64_t now = 0;
++    if(hk_app_context_time(ctx, &clock) == HK_OK)
++        (void)hk_time_now_us(clock, &now);
++    return now;
++}
++
++static uint8_t retire(void)
++{
++    ai_model_runtime_tick(&s_runtime);
++    if(s_runtime.state == AI_MODEL_STATE_UNLOAD_PENDING)
++        return 0U;
++    s_closing = 0U;
++    return 1U;
++}
++
++static void close_model(hk_deadline_t deadline)
++{
++    s_generating = s_inflight = s_cpu_ready = 0U;
++    ai_model_storage_free(s_cpu_bytes);
++    s_cpu_bytes = NULL;
++    if(s_closing)
++        return;
++    ai_model_runtime_limit_unload(&s_runtime, deadline.at_us);
++    ai_model_runtime_request_unload(&s_runtime);
++    s_closing = !retire();
++    if(s_closing)
++        (void)resource_cleanup_schedule(RESOURCE_CLEANUP_KIBBLE, retire);
++}
++
++static hk_result_t load_failure(const char **status, const char *message)
++{
++    close_model(HK_DEADLINE_IMMEDIATE);
++    *status = message;
++    return HK_ERR_IO;
++}
++
++static hk_result_t load_cpu(const char **status)
++{
++    ai_model_storage_result_t result;
++    if(!s_cpu_bytes)
++    {
++        uint32_t size;
++        result = ai_model_storage_load(KIBBLE_DIRECTORY, KIBBLE_DIRECTORY "/cpu.bin",
++            sizeof(kibble_cpu_model_t), 256U, 0U, NULL, &s_cpu_bytes, &size, &s_cpu_crc, &s_cpu_reader);
++        if(result == AI_MODEL_STORAGE_NO_SD)
++            return load_failure(status, "Insert model SD");
++        if(result == AI_MODEL_STORAGE_DIRECTORY || result == AI_MODEL_STORAGE_FILE)
++            return load_failure(status, "Model files missing");
++        if(result != AI_MODEL_STORAGE_PENDING || size != sizeof(kibble_cpu_model_t))
++            return load_failure(status, "CPU package error");
++        return HK_PENDING;
++    }
++    result = ai_model_storage_read_step(&s_cpu_reader, s_cpu_bytes, sizeof(kibble_cpu_model_t), &s_cpu_crc);
++    if(result == AI_MODEL_STORAGE_PENDING)
++        return HK_PENDING;
++    const kibble_cpu_model_t *cpu = (const kibble_cpu_model_t *)s_cpu_bytes;
++    if(result != AI_MODEL_STORAGE_OK || s_cpu_crc != KIBBLE_CPU_CRC ||
++       memcmp(cpu->magic, "KLB1", 4) || cpu->model_crc != KIBBLE_MODEL_CRC)
++        return load_failure(status, "CPU package invalid");
++    s_cpu_ready = 1U;
++    return HK_OK;
++}
++
++hk_result_t hk_app_kibble_open_step(const hk_app_context_t *ctx, const char **status)
++{
++    hk_result_t result = authorized(ctx, 1U);
++    if(result != HK_OK || !status)
++        return result != HK_OK ? result : HK_ERR_INVALID_ARGUMENT;
++    *status = "Loading model";
++    if(!KIBBLE_MODEL_CRC || !KIBBLE_CPU_CRC)
++        return load_failure(status, "Model not built");
++    if(s_closing)
++        return HK_PENDING;
++    if(s_runtime.state == AI_MODEL_STATE_FAULT)
++        return load_failure(status, "KPU needs reset");
++    if(!s_cpu_ready)
++    {
++        result = load_cpu(status);
++        if(result != HK_OK)
++            return result;
++    }
++    if(!ai_model_runtime_loaded(&s_runtime))
++    {
++        ai_model_result_t load = ai_model_runtime_load_related_step(&s_runtime, &s_descriptor, NULL, NULL);
++        if(load == AI_MODEL_RESULT_PENDING || load == AI_MODEL_RESULT_BUSY)
++            return HK_PENDING;
++        if(load != AI_MODEL_RESULT_OK)
++            return load_failure(status, ai_model_runtime_result_label(load));
++    }
++    *status = NULL;
++    return HK_OK;
++}
++
++hk_result_t hk_app_kibble_start(const hk_app_context_t *ctx, const char *prompt, uint32_t seed)
++{
++    hk_result_t result = authorized(ctx, 1U);
++    if(result != HK_OK)
++        return result;
++    if(s_generating || s_inflight)
++        return HK_ERR_BUSY;
++    if(!s_cpu_ready || !ai_model_runtime_loaded(&s_runtime))
++        return HK_ERR_INVALID_STATE;
++    if(!prompt || !kibble_tokenize((const kibble_cpu_model_t *)s_cpu_bytes, prompt, s_context))
++        return HK_ERR_INVALID_ARGUMENT;
++    s_seed = seed;
++    s_generated = 0U;
++    s_generating = 1U;
++    return HK_OK;
++}
++
++hk_result_t hk_app_kibble_poll(const hk_app_context_t *ctx, hk_kibble_token_t *token)
++{
++    hk_result_t result = authorized(ctx, 1U);
++    if(result != HK_OK || !token)
++        return result != HK_OK ? result : HK_ERR_INVALID_ARGUMENT;
++    if(!s_generating)
++        return HK_ERR_INVALID_STATE;
++    const kibble_cpu_model_t *cpu = (const kibble_cpu_model_t *)s_cpu_bytes;
++    if(!s_inflight)
++    {
++        kibble_input(cpu, s_context, s_input);
++        if(!ai_model_runtime_run(&s_runtime, s_input))
++            return HK_ERR_IO;
++        s_inflight = 1U;
++        s_inference_deadline = now_us(ctx) + 1000000U;
++        return HK_PENDING;
++    }
++    uint64_t started = now_us(ctx);
++    if(!ai_model_runtime_take_completion(&s_runtime))
++        return started < s_inference_deadline ? HK_PENDING : HK_ERR_DEADLINE_EXCEEDED;
++
++    s_inflight = 0U;
++    const uint8_t *output;
++    size_t size;
++    if(ai_model_runtime_get_output(&s_runtime, 0, &output, &size) || size != KIBBLE_OUTPUT_BYTES)
++        return HK_ERR_IO;
++    uint16_t next = kibble_sample(cpu, (const float *)output, &s_seed);
++    *token = (hk_kibble_token_t){ .end = next == KIBBLE_EOS, .accelerator_us = s_runtime.last_inference_us,
++                                  .cpu_us = (uint32_t)(now_us(ctx) - started) };
++    if(!token->end)
++    {
++        memcpy(token->text, cpu->pieces[next], sizeof(token->text));
++        kibble_append(s_context, next);
++    }
++    if(token->end || ++s_generated == HK_KIBBLE_GENERATION_MAX)
++        s_generating = 0U;
++    return HK_OK;
++}
++
++hk_result_t hk_app_kibble_close(const hk_app_context_t *ctx, hk_deadline_t deadline)
++{
++    hk_result_t result = authorized(ctx, 0U);
++    if(result == HK_OK)
++        close_model(deadline);
++    return result;
++}
++#endif
+diff --git a/sdk/include/hackylens/app/kibble.h b/sdk/include/hackylens/app/kibble.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c367109ed3948d9bb2c987c18b7d4403e282246
+--- /dev/null
++++ b/sdk/include/hackylens/app/kibble.h
+@@ -0,0 +1,31 @@
++#ifndef HACKYLENS_APP_KIBBLE_H
++#define HACKYLENS_APP_KIBBLE_H
++
++#include <hackylens/app/context.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum { HK_KIBBLE_PROMPT_MAX = 24, HK_KIBBLE_TOKEN_MAX = 16, HK_KIBBLE_GENERATION_MAX = 48 };
++
++typedef struct
++{
++    char text[HK_KIBBLE_TOKEN_MAX + 1];
++    uint32_t accelerator_us;
++    uint32_t cpu_us;
++    uint8_t end;
++} hk_kibble_token_t;
++
++/* All calls are scoped to the built-in KibbleLM app's current callback.
++ * Open and poll return HK_PENDING while their work is in flight. */
++hk_result_t hk_app_kibble_open_step(const hk_app_context_t *ctx, const char **status);
++hk_result_t hk_app_kibble_start(const hk_app_context_t *ctx, const char *prompt, uint32_t seed);
++hk_result_t hk_app_kibble_poll(const hk_app_context_t *ctx, hk_kibble_token_t *token);
++hk_result_t hk_app_kibble_close(const hk_app_context_t *ctx, hk_deadline_t deadline);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
