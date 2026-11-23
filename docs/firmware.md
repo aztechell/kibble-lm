@@ -1,4 +1,4 @@
-# Run KibbleLM on HUSKYLENS SEN0305
+# Run KibbleLM on K210 boards
 
 ## Flash the release
 
@@ -39,6 +39,16 @@ python tools/build_firmware.py full --board huskylens-sen0305 --require-app kibb
 ```
 
 The build writes the flash image and sidecar to `dist`. When using a newly exported checkpoint, copy its generated `kibble_model_contract.h` into `firmware/src/runtime/` before building and use the matching `model.kmodel` and `cpu.bin` on the card.
+
+## Build for Maix Cube
+
+Use the same pinned checkout, patch, and toolchain setup above, then select the Cube target.
+
+```powershell
+python tools/build_firmware.py full --board sipeed-maix-cube --require-app kibble-lm
+```
+
+Use the Cube-specific `dist/hackylens-full-sipeed-maix-cube.bin` and matching `.json` sidecar with the [HackyLens Maix Cube instructions](https://github.com/aztechell/hackylens/blob/731ad75b9f96ca6b1f3c7c1211cb6677f09466ac/docs/MAIX_CUBE.md#build-and-artifacts). The v0.1.0 microSD archive works with this build. On Cube, use the three-way control for LEFT, RIGHT, and OK, and POW for BACK. See the [Maix Cube measurements](model-card.md#sipeed-maix-cube).
 
 ## Debug UART
 

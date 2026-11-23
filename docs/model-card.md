@@ -28,3 +28,14 @@ Measurements and the [LCD capture](images/kibblelm-lcd.png) come from the SEN030
 | The puppy found | 60.0 ms | 13.19 |
 
 Both runs generated 48 tokens, the app's limit for a single continuation. The app stops early on EOS and ends displayed text at a word boundary when it reaches the limit. The benchmark divides generated tokens by the app's generation elapsed time. The [board check](../board_check.py) records the same counters via debug UART.
+
+### Sipeed Maix Cube
+
+The [Maix Cube capture](images/kibblelm-cube-lcd.png) comes from the full HackyLens 0.9.0 build for `sipeed-maix-cube`, on the same base revision and with the v0.1.0 model package on microSD. The firmware ran from RAM. Its SHA-256 was `ad715acfd5af9841ee490bc95132763d751d8a8f3585b06a278d09ccdd2fa4e1`.
+
+| Prompt | Generated tokens | Time to first token | Tokens/s with LCD updates |
+| --- | ---: | ---: | ---: |
+| Once upon a time | 48 | 52.8 ms | 15.45 |
+| The puppy found | 48 | 52.6 ms | 15.48 |
+
+Switching to Face Detect during generation let the next app run KPU inference. Reopening KibbleLM and repeating the custom prompt with seed 210 reproduced the same text. The test used UART controls and captured the LCD at 240 × 240. The missing-model status is clipped to `Model files` on that display.

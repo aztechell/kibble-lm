@@ -28,12 +28,19 @@ The model was trained from scratch on 100,000 TinyStories. Perplexity is measure
 
 The [training guide](docs/training.md) covers data preparation, FP32 training, KPU calibration, and distillation of the CPU projection. It also shows how to verify the compiled graph with the nncase simulator on a PC.
 
+On a shared 256-story slice, KibbleLM FP32 scored **1.277 bits/byte**, compared with **1.011** for stories260K and **1.016** for MicroMixer-4-300K. [Peer comparison, samples, and reproduction](docs/peer-comparison.md)
+
 ## Hardware demo
 
-The HackyLens app runs the exported model on HUSKYLENS SEN0305 and displays the continuation on the LCD. Its benchmark measured **13.2 tokens/s** with display updates and **60–63 ms** to the first token. [Benchmark setup](docs/model-card.md#hardware-measurements)
+The same 374 KiB model package ran on two K210 boards. Both measurements include LCD updates.
 
-<img src="docs/images/kibblelm-lcd.png" width="320" height="240" alt="KibbleLM continuing a story on the HUSKYLENS LCD">
+| Board | Tokens/s | Time to first token |
+| --- | ---: | ---: |
+| HUSKYLENS SEN0305 | 13.19 | 60.0–62.7 ms |
+| Sipeed Maix Cube | 15.45–15.48 | 52.6–52.8 ms |
 
-[Try the HUSKYLENS demo](docs/firmware.md#flash-the-release) · [Build the integration](docs/firmware.md#build-the-firmware)
+<img src="docs/images/kibblelm-lcd.png" width="320" height="240" alt="KibbleLM on the HUSKYLENS LCD"> <img src="docs/images/kibblelm-cube-lcd.png" width="240" height="240" alt="KibbleLM on the Maix Cube LCD">
+
+[Benchmark builds](docs/model-card.md#hardware-measurements) · [SEN0305 release](docs/firmware.md#flash-the-release) · [Maix Cube build](docs/firmware.md#build-for-maix-cube)
 
 KibbleLM source code is available under the [MIT License](LICENSE).
