@@ -1,10 +1,10 @@
 # KibbleLM model card
 
-KibbleLM continues short English stories on HUSKYLENS SEN0305. It uses a fixed context of 32 subword tokens and a vocabulary of 2,048 BPE pieces. The app generates up to 48 new tokens, stops early on EOS, and ends displayed text at a word boundary when it reaches the limit.
+KibbleLM is a 314,336-parameter convolutional language model for short English story continuations. It predicts a next subword from a context of 32 tokens and uses a 2,048-token BPE vocabulary. The backbone targets the Kendryte K210 KPU.
 
 ## Architecture
 
-The CPU gathers embeddings and arranges the 32 context tokens as a 4×8 grid. The KModel v4 runs four 3×3 Conv2D + ReLU layers on the K210 KPU. The CPU projects 64 features at the center position into vocabulary logits using INT8 weights, then samples from the top 16 tokens. The two files on microSD occupy 382,944 bytes together.
+The CPU gathers 32-channel embeddings into a 4×8 grid. The KModel v4 takes a `uint8` tensor of shape `[1, 32, 4, 8]` in NCHW layout and runs four 3×3 Conv2D + ReLU layers. Its FP32 output has shape `[1, 64, 4, 8]`. The CPU projects the 64 features at grid position `(2, 3)` into vocabulary logits using INT8 weights, then samples from the top 16 tokens. `model.kmodel` is 119,336 bytes. With `cpu.bin`, the exported model takes 382,944 bytes.
 
 ## Data and evaluation
 
@@ -27,4 +27,4 @@ Measurements and the [LCD capture](images/kibblelm-lcd.png) come from the SEN030
 | Once upon a time | 62.7 ms | 13.19 |
 | The puppy found | 60.0 ms | 13.19 |
 
-Both runs generated 48 tokens. The measurement counts generated tokens across the app's generation elapsed time. The [board check](../board_check.py) records the same counters via debug UART.
+Both runs generated 48 tokens, the app's limit for a single continuation. The app stops early on EOS and ends displayed text at a word boundary when it reaches the limit. The benchmark divides generated tokens by the app's generation elapsed time. The [board check](../board_check.py) records the same counters via debug UART.

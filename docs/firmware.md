@@ -18,6 +18,13 @@ python tools/hkflash.py flash-monitor $firmware --board huskylens-sen0305 --port
 
 Extract `kibblelm-sd-v0.1.0.zip` to the root of a FAT32 microSD card. Open **KibbleLM** once the firmware has booted and the card is inserted. The app's default location is `hackylens.kmodels/kibblelm`.
 
+| Control | Action |
+| --- | --- |
+| LEFT / RIGHT | Choose a prompt. After generation starts, tap to scroll one line or hold to keep scrolling. |
+| OK | Start a continuation. |
+| Hold OK | Clear the story and return to prompt selection. |
+| BACK | Return to the menu. |
+
 ## Build the firmware
 
 Keep `kibble-lm` and `hackylens` as sibling directories. In a clean HackyLens checkout, apply the patch and follow the upstream [toolchain setup](https://github.com/aztechell/hackylens/tree/731ad75b9f96ca6b1f3c7c1211cb6677f09466ac#build). The patch includes the descriptor for the model in the release.
