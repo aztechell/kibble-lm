@@ -1,14 +1,15 @@
-# KibbleLM and two sub-350K story models
+# KibbleLM and compact story models
 
-[stories260K](https://huggingface.co/karpathy/tinyllamas/tree/0bd21da7698eaf29a0d7de3992de8a46ef624add/stories260K) is the Llama-style checkpoint used by the [ESP32-S3 port](https://github.com/DaveBben/esp32-llm). [MicroMixer-4-300K-TinyStories](https://huggingface.co/llaa33219/MicroMixer-4-300K-TinyStories) is about 7% smaller than KibbleLM by parameter count and uses gated dilated convolutions for causal token mixing. Both were trained on TinyStories.
+stories260K is the Llama-style checkpoint used by the ESP32-S3 port. MicroMixer-4-300K uses gated dilated convolutions for causal token mixing. Both were trained on TinyStories. [stories260K](https://huggingface.co/karpathy/tinyllamas/tree/0bd21da7698eaf29a0d7de3992de8a46ef624add/stories260K) · [ESP32-S3 port](https://github.com/DaveBben/esp32-llm) · [MicroMixer-4-300K](https://huggingface.co/llaa33219/MicroMixer-4-300K-TinyStories)
 
 | Model | Parameters | Vocabulary | Input limit | Bits/byte ↓ | FP32 checkpoint + tokenizer |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| KibbleLM FP32 | 314,336 | 2,048 BPE | 32 tokens | 1.2768 | 1,365.0 KiB |
+| KibbleLM v0.2 FP32 | 446,232 | 2,048 BPE | 32 tokens | 1.1350 | 1,881.0 KiB |
+| KibbleLM v0.1 FP32 | 314,336 | 2,048 BPE | 32 tokens | 1.2768 | 1,365.0 KiB |
 | stories260K | 260,032 | 512 SentencePiece | 512 tokens | 1.0113 | 1,043.7 KiB |
 | MicroMixer-4-300K | 292,525 | 256 byte values | 1,024 bytes | 1.0161 | 1,171.5 KiB |
 
-Both peers assigned higher likelihood to the reference stories. Their scores were close on this slice. KibbleLM uses a fixed 32-token window and a [374 KiB deployment package](model-card.md#architecture), with its four convolutions on the K210 KPU. All table scores are from FP32 inference on a PC. The [on-device measurements](model-card.md#hardware-measurements) cover the compiled KibbleLM package. MicroMixer's vocabulary is implemented directly in code, so it has no separate tokenizer file.
+KibbleLM v0.2 reduced the gap to stories260K by 53% on this slice. Both peers assigned higher likelihood to the reference stories. KibbleLM v0.2 has a 503 KiB K210 deployment package, with four convolutions on the KPU. All table scores come from FP32 inference on a PC. MicroMixer's vocabulary is implemented in code. [Deployment format](model-card.md#architecture)
 
 [MicroMixer-4-500K](https://huggingface.co/llaa33219/MicroMixer-4-500K-TinyStories) is another open checkpoint at 491,742 parameters. [stories511K](https://huggingface.co/millrace-ai/stories511K) is an example of a smaller download at 230.4 KiB, with 511,008 parameters packed in INT4 and compressed with XZ. Its supplied runner expands the weights to FP32 in memory. The two 500K-class models are listed for reference.
 
@@ -20,17 +21,18 @@ Each model sees its native tokenization and available preceding context. The sco
 
 ## Sample continuations
 
-All three models continued `Once upon a time` with seed 210, temperature 0.85, and top-k 16. The first complete sentence from each run is shown here. The script also records two other prompts and up to 160 bytes of continuation for each.
+Each checkpoint continued `Once upon a time` with seed 210, temperature 0.85, and top-k 16. The first sentence from each run is shown here. The script also records two other prompts and up to 160 bytes of continuation for each.
 
 | Model | First sentence |
 | --- | --- |
-| KibbleLM FP32 | Once upon a time, a little girl who wanted to help him when he saw something strange brightly in the kitchen. |
+| KibbleLM v0.2 FP32 | Once upon a time, a little girl named Lily went to the beach with his friends. |
+| KibbleLM v0.1 FP32 | Once upon a time, a little girl who wanted to help him when he saw something strange brightly in the kitchen. |
 | stories260K | Once upon a time, there was a little girl named Lily. |
 | MicroMixer-4-300K | Once upon a time, there was a dog named Max. |
 
 ## Reproduce the run
 
-Start with the [training environment and prepared KibbleLM data](training.md), including `runs/v2/best.pt`. The reported run used PyTorch 2.8.0 with CUDA 12.8. The KibbleLM FP32 checkpoint SHA-256 was `e07b5a81c437e25df9eef4dafd1f8d6cd2eb7ee6ab481e36f54807425f1067da`.
+Set up PyTorch 2.8.0 and the repository requirements. Extract the FP32 archive into `.tools/kibblelm-fp32` for the v0.2 checkpoint and tokenizer. The v0.2 comparison used CPU inference. Its checkpoint SHA-256 was `8c9cac0b83dc3c37741930acae4839920d5e149c7f955c87b1b6d7c314dc9ecf`. [Training environment](training.md) · [v0.2 FP32 archive](https://github.com/aztechell/kibble-lm/releases/download/v0.2.0/kibblelm-fp32-v0.2.0.zip)
 
 ```powershell
 uv pip install sentencepiece==0.2.1 safetensors==0.6.2
@@ -46,7 +48,7 @@ Invoke-WebRequest "$mixer/epoch_2.safetensors" -OutFile "$peers/epoch_2.safetens
 git clone --filter=blob:none --sparse https://github.com/llaa33219/MicroMixer-4.git "$peers/MicroMixer-4"
 git -C "$peers/MicroMixer-4" sparse-checkout set src
 git -C "$peers/MicroMixer-4" checkout --detach 8300d64843dd9e0baa9270600632c25e5aa15dc5
-.venv/Scripts/python.exe compare_peers.py
+.venv/Scripts/python.exe compare_peers.py --device cpu --checkpoint .tools/kibblelm-fp32/best.pt --data .tools/kibblelm-fp32
 ```
 
 The [comparison script](../compare_peers.py) writes `runs/peer-comparison/comparison.json` with exact scores, checkpoint hashes, and generated samples.

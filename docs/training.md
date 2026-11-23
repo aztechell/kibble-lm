@@ -1,6 +1,6 @@
 # Train and export KibbleLM
 
-The tested workflow uses Windows x64, Python 3.12, `uv`, and an NVIDIA GPU with CUDA. The released checkpoint was trained on an RTX 4060 Laptop GPU. The [training config](../config.json) fixes the dataset revision, subset sizes, seed, and 40,000 training steps. The dataset is [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories).
+The tested workflow uses Windows x64, Python 3.12, `uv`, and an RTX 4060 Laptop GPU with CUDA. The [v0.1 config](../config.json) fixes the initial training seed and 40,000 steps on 100,000 TinyStories. The [v0.2 config](../config-v0.2.json) uses all four training shards at the same pinned revision. [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories)
 
 Run the following from `kibble-lm`.
 
@@ -13,21 +13,51 @@ $python = '.venv/Scripts/python.exe'
 & $python export.py --smoke --work runs/smoke
 & $python prepare.py
 & $python train.py
-& $python export.py --work runs/export-final
 ```
 
 The bootstrap checks the SHA-256 of the Windows nncase v0.2.0-beta4 archive. The smoke test compiles a synthetic backbone and compares the simulator against ONNX. Pick a fresh `--work` directory when repeating a conversion. [nncase release](https://github.com/kendryte/nncase/releases/tag/v0.2.0-beta4)
 
-Preparation normalizes stories to printable ASCII, keeps disjoint training and validation stories, and trains a 2,048-token BPE tokenizer. Training saves the best FP32 checkpoint and its report in `runs/v2`. Export calibrates the KPU backbone on 512 training windows. It uses 8,192 additional training inputs to distill the INT8 CPU projection against the float model. The manifest reports perplexity for all three variants on the same 4,096 validation targets.
+Preparation normalizes stories to printable ASCII, keeps disjoint training and validation stories, and trains a 2,048-token BPE tokenizer. The commands above produce the initial FP32 checkpoint in `runs/v2`.
 
-Export writes the SD tree, hardware descriptor, and model manifest to `dist`. The [model card](model-card.md) records the result for the published checkpoint. To use a new export in firmware, apply the [build instructions](firmware.md#build-the-firmware).
+## Expand the training set
+
+The v0.2 preparation run encoded 1,798,537 unique training stories and 2,000 validation stories. Reusing the tokenizer keeps the validation arrays byte-identical to those from v0.1.
+
+```powershell
+& $python prepare.py --config config-v0.2.json --data data/v0.2 --cache data --tokenizer data/tokenizer.json
+& $python train.py --config config-v0.2.json --data data/v0.2 --context 32 --steps 80000 --init-checkpoint runs/v2/best.pt --out runs/v0.2-c32
+& $python train.py --config config-v0.2.json --data data/v0.2 --train-teacher --steps 48000 --batch-size 32 --learning-rate 0.0008 --out runs/v0.2-teacher
+& $python train.py --config config-v0.2.json --data data/v0.2 --context 32 --inner-channels 64 96 96 --steps 80000 --learning-rate 0.0007 --train-seed 3202 --init-checkpoint runs/v0.2-c32/best.pt --teacher-checkpoint runs/v0.2-teacher/best.pt --out runs/v0.2-kd32
+```
+
+The Transformer teacher uses the same vocabulary and predicts with up to 128 tokens of history. Student distillation pairs its soft predictions with the original next-token labels. The teacher runs during training on the PC. Deployment uses the CNN and its INT8 projection.
+
+The final stage widens the readout to 76 features and fine-tunes it with quantization-aware training. The simulated path applies the KPU's uint8 quantization to the inputs, folded convolution weights, and activations. The checkpoint at step 26,000 had the lowest simulated loss. The actual export is evaluated separately in the nncase simulator.
+
+```powershell
+& $python train.py --config config-v0.2.json --data data/v0.2 --context 32 --inner-channels 64 96 96 --features 76 --steps 28000 --learning-rate 0.00035 --train-seed 3276 --qat --init-checkpoint runs/v0.2-kd32/best.pt --out runs/v0.2-qat76
+```
+
+## K210 export
+
+Export calibrates the backbone on 512 training windows. The default alignment uses 8,192 additional training inputs. Part of that sample fits the projection, and the remainder selects among direct INT8 quantization, an affine correction, and a distilled projection. The manifest measures the selected export on 4,096 fixed validation targets.
+
+The embedding table stores `round(255 × sigmoid(weight))`. The compiler options `--input-mean 0 --input-std 1` fix the input quantizer to this representation. [nncase Beta4 compiler source](https://github.com/kendryte/nncase/blob/v0.2.0-beta4/src/cli/compile.cpp)
+
+Export writes an SD tree, hardware descriptor, and model manifest. The recorded v0.2 run used 4,096 alignment inputs. The [model card](model-card.md) records results for the checkpoint.
+
+```powershell
+& $python export.py --work runs/v0.2-export --data data/v0.2 --checkpoint runs/v0.2-qat76/best.pt --out dist-v0.2 --package-name kibble02 --alignment-tokens 4096
+```
+
+Follow the [build instructions](firmware.md#build-the-firmware) to compile the matching descriptor into the hardware demo.
 
 ## Check the Python and C boundary
 
 With the patched HackyLens checkout and host GCC available, run the C parity check. It compiles the production decoder and tests the tokenizer, CHW input bytes, and seeded sampler against fixtures generated by the export.
 
 ```powershell
-& $python check_peer.py --work runs/export-final
+& $python check_peer.py --work runs/v0.2-export --package dist-v0.2/hackylens.kmodels/kibble02/cpu.bin
 ```
 
 Use `--cc` to select a different host GCC binary. For display and lifecycle checks on the device, use the [board check](firmware.md#debug-uart).

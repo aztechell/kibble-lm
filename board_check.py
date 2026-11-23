@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 INFO = re.compile(r"HKKLINFO phase=(\d+) tokens=(\d+) first_us=(\d+) elapsed_us=(\d+) accelerator_us=(\d+) head_us=(\d+)")
+PORTS = {"huskylens-sen0305": "COM10", "sipeed-maix-cube": "COM5"}
 
 
 def send(link, command):
@@ -92,6 +93,32 @@ def boot(link, image, hkflash, paced_isp):
     print(f"[RAM] {len(raw)} bytes @ {link.baudrate}", flush=True)
     isp.memory_write(hkflash.STUB_ADDRESS, raw)
     isp.boot_sram()
+    wait_boot(link)
+
+
+def boot_cube(link, image, hkflash):
+    raw = image.read_bytes()
+    if not 0 < len(raw) < 2 * 1024 * 1024:
+        raise ValueError("Expected a raw Cube RAM image below 2 MiB")
+    isp = hkflash.K210Isp(link)
+    hkflash.connect_bootrom_sipeed_goe(isp, link, attempts=3)
+    try:
+        baud = 1_500_000
+        isp.write_packet(hkflash.request(0xc6, struct.pack("<III", 0, 4, int(baud * 38.6 / 38))))
+        time.sleep(0.05)
+        link.baudrate = baud
+        isp.bootrom_greeting(retries=2, timeout=0.4)
+        print(f"[RAM] {len(raw)} bytes @ {link.baudrate}", flush=True)
+        isp.memory_write(hkflash.STUB_ADDRESS, raw)
+    except (OSError, hkflash.ProtocolError):
+        link.baudrate = 115200
+        hkflash.connect_bootrom_sipeed_goe(isp, link, attempts=3)
+        isp.memory_write(hkflash.STUB_ADDRESS, raw)
+    isp.boot_sram()
+    wait_boot(link)
+
+
+def wait_boot(link):
     link.baudrate = 115200
     time.sleep(1)
     for _ in range(4):
@@ -116,34 +143,49 @@ def generate(link, cmd, path, hkflash):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hackylens", type=Path, default=Path("../hackylens"))
-    parser.add_argument("--port", default="COM10")
+    parser.add_argument("--board", default="huskylens-sen0305", choices=PORTS)
+    parser.add_argument("--port")
     parser.add_argument("--image", type=Path)
+    parser.add_argument("--manifest", type=Path, default=Path("dist/manifest.json"))
     parser.add_argument("--out", type=Path, default=Path("runs/board"))
-    parser.add_argument("--check-card", action="store_true", help="Read FAT32 mount status from the test firmware and exit")
-    parser.add_argument("--fixture", action="store_true", help="Install new package files with the RAM-only provisioner")
+    fixture = parser.add_mutually_exclusive_group()
+    fixture.add_argument("--check-card", action="store_true", help="Read FAT32 mount status from the test firmware and exit")
+    fixture.add_argument("--fixture", action="store_true", help="Install the model before profiling the test firmware")
+    fixture.add_argument("--install-only", action="store_true", help="Use the RAM-only provisioner, then exit")
     args = parser.parse_args()
     sys.path.insert(0, str(args.hackylens.resolve() / "tools"))
     import hkflash
-    from object_gate_ram import PacedIsp
+
+    def progress(prefix, done, total):
+        if done == total or done % (256 * 1024) == 0:
+            print(f"{prefix}: {done:,}/{total:,} bytes", flush=True)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    with hkflash.open_runtime_serial(hkflash.require_serial(), args.port, 115200) as link:
+    hkflash.progress = progress
+    port = args.port or PORTS[args.board]
+    with hkflash.open_runtime_serial(hkflash.require_serial(), port, 115200) as link:
         if args.image:
-            boot(link, args.image, hkflash, PacedIsp)
+            if args.board == "sipeed-maix-cube":
+                boot_cube(link, args.image, hkflash)
+            else:
+                from object_gate_ram import PacedIsp
+                boot(link, args.image, hkflash, PacedIsp)
         if args.check_card:
             print(command(link, "HKKLCARD", r"HKKLCARD present=\d mounted=\d heap=\d+"), flush=True)
             return
-        report = {"board": "huskylens-sen0305"}
+        report = {"board": args.board}
         if args.image:
             report["firmware_sha256"] = hashlib.sha256(args.image.read_bytes()).hexdigest()
-        manifest = Path("dist/manifest.json")
-        if manifest.exists():
-            info = json.loads(manifest.read_text())
+        if args.manifest.exists():
+            info = json.loads(args.manifest.read_text())
             report.update(model_sha256=info["model"]["sha256"], cpu_sha256=info["cpu"]["sha256"])
-        if args.fixture:
-            report["sd_install"] = command(link, "HKKLINSTALL", r"HKKLINSTALL .*", timeout=45)
+        if args.fixture or args.install_only:
+            report["sd_install"] = command(link, "HKKLINSTALL", r"HKKLINSTALL .*", timeout=60)
             if not report["sd_install"].startswith("HKKLINSTALL OK"):
                 raise RuntimeError(report["sd_install"])
+            if args.install_only:
+                print(report["sd_install"], flush=True)
+                return
             report["before_open"] = command(link, "HKKLCARD", r"HKKLCARD present=1 mounted=1 heap=\d+")
         command(link, "HKAPP kibble-lm", r"HKAPP OK")
         wait_phase(link, 1)
@@ -167,7 +209,7 @@ def main():
                 break
             time.sleep(0.25)
         else:
-            report["face_after_switch"] = face
+            raise RuntimeError(f"Face Detect did not take the KPU lease: {face}")
         command(link, "HKAPP kibble-lm", r"HKAPP OK")
         wait_phase(link, 1)
         command(link, "HKKL The puppy found", r"HKKL OK")

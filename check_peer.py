@@ -26,22 +26,30 @@ def main():
     core.kibble_input.restype = None
     core.kibble_sample.argtypes = (C.c_void_p, C.POINTER(C.c_float), C.POINTER(C.c_uint32))
     core.kibble_sample.restype = C.c_uint16
+    core.kibble_append.argtypes = (C.POINTER(C.c_uint16), C.c_uint16)
+    core.kibble_append.restype = None
     cpu = C.create_string_buffer(args.package.read_bytes())
     fixtures = json.loads((args.work / "fixtures.json").read_text())
     for fixture in fixtures:
         prompt = fixture["prompt"].encode("ascii")
-        context = (C.c_uint16 * 32)()
-        assert core.kibble_tokenize(cpu, prompt, context) and list(context) == fixture["tokens"], fixture
-        tensor = (C.c_uint8 * 1024)()
+        expected_context = fixture["tokens"]
+        expected_input = (args.work / fixture["input"]).read_bytes()
+        context = (C.c_uint16 * 64)()
+        assert core.kibble_tokenize(cpu, prompt, context), fixture
+        for token in fixture.get("history", []):
+            core.kibble_append(context, token)
+        assert context[:len(expected_context)] == expected_context, fixture
+        tensor = (C.c_uint8 * (32 * 64))()
         core.kibble_input(cpu, context, tensor)
-        assert bytes(tensor) == (args.work / fixture["input"]).read_bytes(), fixture
-        output = (C.c_float * 2048).from_buffer_copy((args.work / fixture["output"]).read_bytes())
+        assert bytes(tensor)[:len(expected_input)] == expected_input, fixture
+        raw_output = (args.work / fixture["output"]).read_bytes()
+        output = (C.c_float * (len(raw_output) // C.sizeof(C.c_float))).from_buffer_copy(raw_output)
         seed = C.c_uint32(210)
         token = core.kibble_sample(cpu, output, C.byref(seed))
         assert (token, seed.value) == (fixture["next"], fixture["next_seed"]), fixture
         print(f"{fixture['prompt']!r}: token {token}, input and logits pipeline match")
     for invalid in (b"A" * 25, b"A\x7f", b"One\nmore"):
-        assert not core.kibble_tokenize(cpu, invalid, (C.c_uint16 * 32)())
+        assert not core.kibble_tokenize(cpu, invalid, (C.c_uint16 * 64)())
 
 
 if __name__ == "__main__":

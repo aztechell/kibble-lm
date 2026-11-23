@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from model import BOS, CONTEXT, EOS, PAD, KibbleLM
+from model import BOS, CONTEXT, EOS, FEATURES, INNER_CHANNELS, PAD, KibbleLM
 from prepare import shard, texts
 
 
@@ -46,14 +46,18 @@ def load_peers(args, device):
     from src.model_v87_final import MicroMixerV87Final, v87_final_300k
     from src.tokenizer import ByteTokenizer
 
-    kibble = KibbleLM().to(device).eval()
+    config_path = args.checkpoint.parent / "config.json"
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    kibble = KibbleLM(config.get("context", CONTEXT), config.get("inner_channels", INNER_CHANNELS),
+                      config.get("layout", "snake"), config.get("features", FEATURES)).to(device).eval()
     kibble.load_state_dict(torch.load(args.checkpoint, map_location="cpu", weights_only=True))
     bpe = Tokenizer.from_file(str(args.data / "tokenizer.json"))
     bpe.encode_special_tokens = True
 
     def cnn_logits(inputs, _targets):
-        windows = F.pad(inputs, (CONTEXT - 1, 0), value=PAD).unfold(-1, CONTEXT, 1)
-        logits = torch.cat([kibble(chunk) for chunk in windows.reshape(-1, CONTEXT).split(512)])
+        context = kibble.context
+        windows = F.pad(inputs, (context - 1, 0), value=PAD).unfold(-1, context, 1)
+        logits = torch.cat([kibble(chunk) for chunk in windows.reshape(-1, context).split(512)])
         return logits.reshape(*inputs.shape, -1)
 
     llama_path = args.peers / "stories260K.pt"
@@ -70,7 +74,7 @@ def load_peers(args, device):
     return (
         Peer("KibbleLM FP32", kibble, lambda text: bpe.encode(text).ids,
              lambda ids: "".join(bpe.id_to_token(token) for token in ids), cnn_logits,
-             bpe.get_vocab_size(), CONTEXT, args.checkpoint),
+             bpe.get_vocab_size(), kibble.context, args.checkpoint),
         Peer("stories260K", llama, sentencepiece.encode, sentencepiece.decode, llama,
              sentencepiece.vocab_size(), llama.params.max_seq_len, llama_path),
         Peer("MicroMixer-4-300K", mixer, lambda text: byte.encode(text)[1:-1], byte.decode,
